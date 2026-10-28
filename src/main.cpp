@@ -41,7 +41,7 @@ void writeJson(int httpStatus, const JsonDocument &doc);
 WiFiHelper wiFiHelper;
 ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
-ServerHelper serverHelper("D1MiniProEnergyMeterV1", &server);
+ServerHelper serverHelper("D1MiniProEnergyMeterV1.1", &server);
 Logger logger;
 
 // PZEM is wired to a software serial port, the hardware UART (USB) stays free for debug output
