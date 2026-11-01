@@ -15,6 +15,8 @@ ISO week and month is published to an MQTT broker, timed by NTP.
 - Live electrical readings from the PZEM-004T v3.0 as JSON (`GET /data`)
 - Energy per hour / day / ISO week / month pushed to MQTT at each period end, using NTP time
   (Europe/Chisinau), queued in RAM while the broker is unreachable. See [docs/MQTT.md](docs/MQTT.md)
+- Wake-on-LAN for the ThinkPad T580 (Proxmox host `.2`) from a Telegram bot or `POST /wol`, with a
+  message once it is up. See [Wake-on-LAN and Telegram bot](#wake-on-lan-and-telegram-bot)
 - Health endpoint for monitoring (`GET /health`)
 - Device info page with flash, chip and WiFi details, plus a firmware upload form (`GET /`)
 - OTA firmware updates over WiFi, from the browser or with one `pio` command
@@ -51,8 +53,10 @@ output at 115200 baud.
 |--------|-----------|-----------------------------------------------------|
 | GET    | `/`       | Device, flash and WiFi info, firmware upload form   |
 | GET    | `/data`   | Current readings from the PZEM                      |
-| GET    | `/health` | Liveness check: `status`, `time_synced`, `mqtt`, `queued`, `dropped`, `heap` |
+| GET    | `/health` | Liveness check: `status`, `time_synced`, `mqtt`, `queued`, `dropped`, `heap`, `telegram`, `telegram_error` |
 | GET    | `/mqtt/test[?msg=text]` | Publishes a test message to `D1MiniProEnergyMeterV1/test` |
+| GET    | `/wol`    | Wake-on-LAN target and `online` (its SSH port answers) |
+| POST   | `/wol`    | Sends the Wake-on-LAN magic packet to the target    |
 | POST   | `/update` | OTA firmware update (multipart form, field `update`) |
 
 Example response from `GET /data`:
@@ -91,6 +95,70 @@ Broker, client ID, base topic, time zone and NTP servers are in
 pip install paho-mqtt
 python scripts/mqtt_monitor.py
 ```
+
+## Wake-on-LAN and Telegram bot
+
+The Proxmox host (ThinkPad T580, `192.168.100.2`) does not power on by itself after a power cut.
+The board can wake it with a Wake-on-LAN magic packet, sent 3 times to the subnet broadcast
+`192.168.100.255`, UDP port 9. The target is set in [`include/AppConfig.h`](include/AppConfig.h)
+(`WOL_TARGET_*`).
+
+```sh
+curl -X POST http://192.168.100.21/wol    # send the magic packet
+curl http://192.168.100.21/wol            # {"online": true} once SSH on the T580 answers
+```
+
+### Telegram commands
+
+| Command (or button)   | What it does |
+|-----------------------|--------------|
+| `/wol` (`Wake T580`)  | Sends the magic packet, then checks every 20 s for 5 min and reports when the T580 is up. If the T580 is already up, it only says so. |
+| `/status` (`Status`)  | T580 up or down, mains voltage and power from the PZEM, board uptime, heap and WiFi signal |
+| anything else, `/start` | Help text and the reply keyboard |
+
+When the board starts, it sends a message with the reset reason. `Power On` means mains power came
+back, which is the moment to send `/wol`.
+
+The bot uses long polling (`getUpdates`) over one kept-alive TLS connection, so no port has to be
+open to the internet. Only messages from `TELEGRAM_CHAT_ID` are handled. Messages from any other
+chat are logged with their chat id and ignored. Commands older than 5 minutes, for example sent
+while the board had no power, are ignored too.
+
+### Setup
+
+1. In Telegram, open [@BotFather](https://t.me/BotFather), send `/newbot`, and pick a name and a
+   username ending in `bot`. BotFather replies with the token (`123456789:AA...`). Use a **new**
+   bot. Two devices polling with the same token take updates from each other (HTTP 409).
+2. Open the new bot and send it any message, for example `/start`.
+3. Find your chat id. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and read
+   `result[0].message.chat.id`. Do this before flashing, because while the board polls, the browser
+   gets nothing.
+4. Add both values to `include/WiFiConfig.h` (git-ignored):
+
+   ```c
+   #define TELEGRAM_BOT_TOKEN  "123456789:AA..."
+   #define TELEGRAM_CHAT_ID    123456789LL
+   ```
+
+5. Flash: `pio run -e d1_mini_ota -t upload`. The bot sends a "started" message with the
+   keyboard.
+6. Optional: in @BotFather, `/setcommands` for the bot, then:
+
+   ```
+   wol - Wake the ThinkPad T580
+   status - Is the T580 up, mains voltage and power
+   ```
+
+`GET /health` shows `"telegram": true` once requests succeed. `telegram_error` is the last
+Telegram HTTP status: 401 means a wrong token, 409 means another poller uses the same token,
+-1 is a connection error and -2 is low heap.
+
+### Target requirements (T580)
+
+- BIOS: `Config > Network > Wake On LAN` set to `AC Only` or `AC and Battery` (currently
+  `ACandBattery`, readable on Proxmox under `/sys/class/firmware-attributes/thinklmi/attributes/`)
+- OS: `ethtool enp0s31f6 | grep Wake-on` must show `g` (it does, set by the e1000e driver)
+- The T580 must be wired. Wake-on-LAN does not work over Wi-Fi.
 
 ## Getting started
 
@@ -160,6 +228,9 @@ The board settings match the original Arduino IDE configuration
 | [MQTT (256dpi)](https://github.com/256dpi/arduino-mqtt)                 | 2.5.2   |
 | [PZEM-004T-v30](https://github.com/mandulaj/PZEM-004T-v30)              | 1.2.1   |
 
+TLS for the Telegram API is BearSSL from the ESP8266 core. It negotiates a 1 KB maximum fragment
+length with `api.telegram.org`, so a connection needs about 16 KB of heap instead of about 30 KB.
+
 ## Project structure
 
 ```
@@ -169,13 +240,15 @@ The board settings match the original Arduino IDE configuration
 │   ├── ServerHelper/         Index page and 404 handler
 │   ├── Logger/               JSON logger over UDP (mirrored to Serial)
 │   ├── EnergyPeriods/        PZEM counter -> per-period records + RAM queue (host-tested)
-│   └── MqttPublisher/        MQTT connection with backoff, drains the queue with QoS 1
+│   ├── MqttPublisher/        MQTT connection with backoff, drains the queue with QoS 1
+│   ├── WakeOnLan/            MAC parsing and magic packet (host-tested)
+│   └── TelegramBot/          Non-blocking Telegram long polling client (getUpdates / sendMessage)
 ├── include/
-│   ├── AppConfig.h           MQTT broker, topic, time zone, NTP servers
-│   └── WiFiConfig.example.h  WiFi credentials template
+│   ├── AppConfig.h           MQTT broker, topic, time zone, NTP servers, Wake-on-LAN target
+│   └── WiFiConfig.example.h  WiFi credentials and Telegram bot token template
 ├── scripts/ota_upload.py     PlatformIO custom upload target for OTA
 ├── scripts/mqtt_monitor.py   Prints the MQTT topics
-├── test/host/                Host unit test for lib/EnergyPeriods
+├── test/host/                Host unit tests for lib/EnergyPeriods and lib/WakeOnLan
 ├── docs/                     MQTT contract, board configuration screenshots
 ├── sloeber_arduino_eclipse/  Original Eclipse Sloeber project (legacy, not built)
 └── platformio.ini            Build environments: d1_mini (USB), d1_mini_ota (WiFi)
@@ -185,6 +258,8 @@ The board settings match the original Arduino IDE configuration
 
 - [ESP01EnergyMeterV2.1](https://github.com/aformusatii/ESP01EnergyMeterV2.1): the same meter on an
   ESP-01S. The MQTT period publishing here is ported from it.
+- PowerManager V1 (`aformusatii/SloeberArduino`, `D1MiniPro_PowerManagerV1/`): the Telegram bot here
+  follows its long polling approach.
 
 ## History
 

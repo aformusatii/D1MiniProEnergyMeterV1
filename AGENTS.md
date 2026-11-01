@@ -11,7 +11,13 @@ meter over SoftwareSerial and exposes the values over HTTP. PlatformIO project (
 
 - Device: static IP `192.168.100.21`
 - Logs: JSON over UDP to `192.168.100.134:5000` / `:5010` (`lib/Logger`), also printed on `Serial`
-- HTTP API: `GET /` (info + upload form), `GET /data` (readings), `GET /health`, `GET /mqtt/test` (test MQTT publish), `POST /update` (OTA)
+- HTTP API: `GET /` (info + upload form), `GET /data` (readings), `GET /health`, `GET /mqtt/test` (test MQTT publish),
+  `GET /wol` (target up?), `POST /wol` (send magic packet), `POST /update` (OTA)
+- Wake-on-LAN + Telegram bot: wakes the Proxmox host ThinkPad T580 (`192.168.100.2`, MAC `48:2A:E3:20:D6:81`)
+  via broadcast to `192.168.100.255:9`. Bot commands `/wol`, `/status`; token and allowed chat id are
+  `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` in `include/WiFiConfig.h` (bot disabled without them).
+  Setup steps: README "Wake-on-LAN and Telegram bot". Use a bot token of its own: the PowerManager board
+  (`.132`) polls its own bot, and two pollers on one token steal each other's updates (HTTP 409).
 - MQTT: energy per hour/day/ISO week/month to Mosquitto `192.168.100.3:1883`, topics
   `D1MiniProEnergyMeterV1/...`, client ID `D1MiniProEnergyMeterV1`, local time Europe/Chisinau from NTP.
   Contract: [docs/MQTT.md](docs/MQTT.md). Ported from `ESP01EnergyMeterV2.1` (topics `energy-meter/...`);
@@ -24,11 +30,13 @@ lib/ServerHelper      index page / 404 handler
 lib/Logger            JSON UDP logger
 lib/EnergyPeriods     PZEM counter -> per-period records + RAM queue (no Arduino deps, host-tested)
 lib/MqttPublisher     MQTT connection with backoff, drains the queue with QoS 1
-include/AppConfig.h   MQTT broker, topic, timezone, NTP servers
-include/WiFiConfig.h  local WiFi credentials (git-ignored; copy from WiFiConfig.example.h)
+lib/WakeOnLan         MAC parsing + magic packet (no Arduino deps, host-tested)
+lib/TelegramBot       non-blocking Telegram long polling client over BearSSL (1 KB MFLN buffers)
+include/AppConfig.h   MQTT broker, topic, timezone, NTP servers, Wake-on-LAN target
+include/WiFiConfig.h  local WiFi credentials + Telegram token/chat id (git-ignored; copy from WiFiConfig.example.h)
 scripts/ota_upload.py PlatformIO custom upload: POSTs firmware.bin to /update
 scripts/mqtt_monitor.py  prints the MQTT topics (pip install paho-mqtt)
-test/host/            host unit test for lib/EnergyPeriods
+test/host/            host unit tests for lib/EnergyPeriods and lib/WakeOnLan
 platformio.ini        envs: d1_mini (serial, COM5) and d1_mini_ota (WiFi)
 ```
 
@@ -52,6 +60,16 @@ Host test for the period logic (needs g++ with POSIX TZ support):
 ```sh
 g++ -std=gnu++17 -Wall -I lib/EnergyPeriods/src test/host/test_energy_periods.cpp \
     lib/EnergyPeriods/src/EnergyPeriods.cpp -o .pio/test_energy_periods && .pio/test_energy_periods
+g++ -std=gnu++17 -Wall -I lib/WakeOnLan/src test/host/test_wake_on_lan.cpp \
+    lib/WakeOnLan/src/WakeOnLan.cpp -o .pio/test_wake_on_lan && .pio/test_wake_on_lan
+```
+
+To exercise the Telegram TLS path without a real token, flash with a dummy one passed as a build flag
+(`WiFiConfig.h` stays untouched). `/health` then shows `"telegram_error":401` and the logs show
+`Telegram connected` with `mfln`, handshake time and heap:
+
+```sh
+PLATFORMIO_BUILD_FLAGS='-DTELEGRAM_BOT_TOKEN=\"123456:dummy\" -DTELEGRAM_CHAT_ID=1LL' pio run -e d1_mini_ota -t upload
 ```
 
 ## OTA upload
@@ -87,7 +105,9 @@ With `eagle.flash.4m.ld` the sketch region is limited to **1,044,464 bytes** (`i
 
 OTA staging is not a constraint on this board: the new image is written into the free flash above
 the running sketch, up to `_FS_start` = `0x3FB000` (~4 MB), so any two images that each fit the
-sketch region also fit together. As of 2026-10-28 `firmware.bin` is 361,536 bytes (with MQTT).
+sketch region also fit together. As of 2026-11-01 `firmware.bin` is 488,224 bytes (with MQTT and the
+Telegram bot; BearSSL adds ~127 KB). Free heap is ~29 KB with the bot disabled (the BearSSL stack is
+reserved at boot) and ~22 KB with the Telegram TLS connection open.
 
 In your report, include the firmware size so that size growth is visible.
 

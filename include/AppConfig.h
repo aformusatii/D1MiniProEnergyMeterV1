@@ -18,4 +18,18 @@
 #define NTP_SERVER_1     "pool.ntp.org"
 #define NTP_SERVER_2     "time.cloudflare.com"
 
+// Wake-on-LAN target: Proxmox host, Lenovo ThinkPad T580 (wired, Intel I219-V enp0s31f6).
+// The magic packet goes to the subnet broadcast address, the IP is only used to check if it is up.
+#define WOL_TARGET_NAME  "ThinkPad T580"
+#define WOL_TARGET_MAC   "48:2A:E3:20:D6:81"
+#define WOL_TARGET_IP    "192.168.100.2"
+// a TCP connect to this port (SSH) tells if the target is up
+#define WOL_CHECK_PORT   22
+
+// Telegram bot: the token and the allowed chat id are secrets, define TELEGRAM_BOT_TOKEN and
+// TELEGRAM_CHAT_ID in include/WiFiConfig.h (git-ignored). Without a token the bot is disabled.
+// Reply keyboard buttons, they send their label as the message text.
+#define TELEGRAM_BTN_WAKE    "Wake T580"
+#define TELEGRAM_BTN_STATUS  "Status"
+
 #endif /* _AppConfig_H_ */
