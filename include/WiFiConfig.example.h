@@ -13,4 +13,8 @@ static const char LOCAL2_KEY[]  = "your-password";
 // #define TELEGRAM_BOT_TOKEN  "123456789:AAExampleExampleExampleExampleExam"
 // #define TELEGRAM_CHAT_ID    123456789LL
 
+// Family group for the daily energy report (README, "Family energy reports"). Group ids are
+// negative. Without it the reports go to TELEGRAM_CHAT_ID.
+// #define TELEGRAM_FAMILY_CHAT_ID  -1001234567890LL
+
 #endif /* _WiFiConfig_H_ */

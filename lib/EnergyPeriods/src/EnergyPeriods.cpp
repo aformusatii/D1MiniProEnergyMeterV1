@@ -6,6 +6,7 @@ EnergyPeriods::EnergyPeriods() {
 	queueHead = 0;
 	queueCount = 0;
 	droppedCount = 0;
+	listener = nullptr;
 }
 
 time_t EnergyPeriods::periodStart(uint8_t period, time_t t) {
@@ -49,7 +50,7 @@ bool EnergyPeriods::needsReading(time_t now) const {
 	}
 
 	for (uint8_t p = 0; p < PERIOD_COUNT; p++) {
-		if ((uint32_t) periodStart(p, now) != state.periods[p].start) {
+		if (state.periods[p].start == 0 || (uint32_t) periodStart(p, now) != state.periods[p].start) {
 			return true;
 		}
 	}
@@ -77,6 +78,15 @@ bool EnergyPeriods::update(time_t now, uint32_t meterWh) {
 		uint32_t newStart = (uint32_t) periodStart(p, now);
 
 		if (newStart == ps.start) {
+			continue;
+		}
+
+		if (ps.start == 0) {
+			// not resumed after a power cycle: only partially covered, like a cold boot
+			ps.start = newStart;
+			ps.startWh = meterWh;
+			ps.fromStart = (newStart == (uint32_t) now) ? 1 : 0;
+			changed = true;
 			continue;
 		}
 
@@ -115,6 +125,10 @@ void EnergyPeriods::push(const EnergyRecord &record) {
 
 	queue[(queueHead + queueCount) % ENERGY_QUEUE_SIZE] = record;
 	queueCount++;
+
+	if (listener != nullptr) {
+		listener(record);
+	}
 }
 
 bool EnergyPeriods::peek(EnergyRecord &record) const {

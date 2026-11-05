@@ -153,6 +153,43 @@ int main() {
 		CHECK(r && !r->complete && r->end == (uint32_t) local(2026, 11, 3, 12, 0), "gap record spans to 12:00, incomplete");
 	}
 
+	// --- listener sees every record, in queue order ---
+	{
+		EnergyPeriods a;
+		static int seen;
+		static uint8_t lastPeriod;
+		seen = 0;
+		a.setListener([](const EnergyRecord &rec) { seen++; lastPeriod = rec.period; });
+		a.update(local(2026, 11, 30, 23, 0), 0);
+		a.update(local(2026, 12, 1, 0, 0), 100);  // closes hour, day and month
+		CHECK(seen == 3 && a.queued() == 3 && lastPeriod == PERIOD_MONTH, "listener %d records", seen);
+	}
+
+	// --- resumed periods continue, periods left at 0 start over without a record ---
+	{
+		EnergyPeriods a;
+		a.update(local(2026, 11, 3, 0, 0), 1000);
+		EnergyPeriods b;
+		b.state.periods[PERIOD_DAY] = a.state.periods[PERIOD_DAY];
+		b.state.valid = 1;
+		CHECK(b.needsReading(local(2026, 11, 3, 15, 10)), "unresumed periods need a reading");
+		b.update(local(2026, 11, 3, 15, 10), 1500);
+		CHECK(b.queued() == 0 && b.state.periods[PERIOD_HOUR].start == (uint32_t) local(2026, 11, 3, 15, 0)
+				&& !b.state.periods[PERIOD_HOUR].fromStart, "hour started over");
+		b.update(local(2026, 11, 4, 0, 0), 2000);
+		EnergyRecord rec;
+		bool dayFound = false;
+		while (b.peek(rec)) {
+			if (rec.period == PERIOD_DAY) {
+				dayFound = true;
+				CHECK(rec.complete && rec.energyWh == 1000, "resumed day complete, %u Wh", rec.energyWh);
+			}
+			if (rec.period == PERIOD_HOUR) CHECK(!rec.complete, "first hour after resume partial");
+			b.pop();
+		}
+		CHECK(dayFound, "day record after resume");
+	}
+
 	// --- meter reset ---
 	{
 		EnergyPeriods a;

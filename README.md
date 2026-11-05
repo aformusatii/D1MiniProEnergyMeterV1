@@ -17,6 +17,10 @@ ISO week and month is published to an MQTT broker, timed by NTP.
   (Europe/Chisinau), queued in RAM while the broker is unreachable. See [docs/MQTT.md](docs/MQTT.md)
 - Wake-on-LAN for the ThinkPad T580 (Proxmox host `.2`) from a Telegram bot or `POST /wol`, with a
   message once it is up. See [Wake-on-LAN and Telegram bot](#wake-on-lan-and-telegram-bot)
+- Daily energy report in a family Telegram group: yesterday's consumption and cost at 07:00, on the
+  1st also the previous month, plus `/today`, `/yesterday`, `/month`. See
+  [Family energy reports](#family-energy-reports)
+- Day/week/month totals survive power cuts (kept in flash), so the monthly total stays exact
 - Health endpoint for monitoring (`GET /health`)
 - Device info page with flash, chip and WiFi details, plus a firmware upload form (`GET /`)
 - OTA firmware updates over WiFi, from the browser or with one `pio` command
@@ -53,10 +57,12 @@ output at 115200 baud.
 |--------|-----------|-----------------------------------------------------|
 | GET    | `/`       | Device, flash and WiFi info, firmware upload form   |
 | GET    | `/data`   | Current readings from the PZEM                      |
-| GET    | `/health` | Liveness check: `status`, `time_synced`, `mqtt`, `queued`, `dropped`, `heap`, `telegram`, `telegram_error` |
+| GET    | `/health` | Liveness check: `status`, `time_synced`, `mqtt`, `queued`, `dropped`, `heap`, `telegram`, `telegram_error`, `telegram_unknown_chat`, `report_due` |
 | GET    | `/mqtt/test[?msg=text]` | Publishes a test message to `D1MiniProEnergyMeterV1/test` |
 | GET    | `/wol`    | Wake-on-LAN target and `online` (its SSH port answers) |
 | POST   | `/wol`    | Sends the Wake-on-LAN magic packet to the target    |
+| GET    | `/report` | Preview of the daily energy report (`text`), target `chat_id`, `due` |
+| POST   | `/report[?to=admin]` | Sends the daily report now to the family chat (or your private chat), without counting it as the 07:00 message |
 | POST   | `/update` | OTA firmware update (multipart form, field `update`) |
 
 Example response from `GET /data`:
@@ -153,6 +159,101 @@ while the board had no power, are ignored too.
 Telegram HTTP status: 401 means a wrong token, 409 means another poller uses the same token,
 -1 is a connection error and -2 is low heap.
 
+## Family energy reports
+
+The same bot also posts to a family group, so others can follow the consumption without access to
+Wake-on-LAN. One bot serves both chats over its single TLS connection (a second polling bot would
+need a second connection, about 16 KB of heap, which the board does not have). Messages are routed
+by chat id:
+
+| Chat | Set by | Gets |
+|------|--------|------|
+| Private chat | `TELEGRAM_CHAT_ID` | `/wol`, `/status`, the start message, and the energy commands |
+| Family group | `TELEGRAM_FAMILY_CHAT_ID` | the daily report and the energy commands. `/wol` is not available here |
+
+Every day at 07:00 (Europe/Chisinau) the group gets yesterday's consumption. On the 1st the same
+message also covers the month that just ended:
+
+```
+⚡ Yesterday, Mon 30 Nov: 11.0 kWh = 39.49 lei
+Previous 7 days: 11.0 kWh/day on average (+0%)
+
+📅 November 2026: 352.1 kWh = 1264.04 lei
+11.7 kWh/day on average
+October 2026: 330.0 kWh (November +7%)
+November 2025: 300.0 kWh (November +17%)
+```
+
+On other days the second part shows the month so far and a forecast:
+
+```
+November so far: 42.0 kWh = 150.78 lei
+Forecast for November: ~420 kWh = ~1508 lei
+```
+
+| Command      | Answer |
+|--------------|--------|
+| `/today`     | used since midnight and its cost, power right now, yesterday's total |
+| `/yesterday` | the daily report for the newest finished day |
+| `/month`     | this month so far, forecast for the month, last month's total |
+
+The price (`ENERGY_PRICE_PER_KWH`, 3.59 lei), the currency and the report time are in
+[`include/AppConfig.h`](include/AppConfig.h). Costs are kWh × price, rounded to bani.
+
+Delivery:
+
+- If the board or the internet is down at 07:00, the report goes out as soon as it is back. Each day
+  is reported once, even across reboots. Only the newest day is reported: if several days were
+  missed, they are not sent one by one.
+- Day, week and month in progress and the report history (last 8 days, last 13 months) are kept in
+  flash, written about twice a day. After a power cut the totals continue from the PZEM counter,
+  which keeps its value. Nothing is consumed while the mains is off, so the totals stay exact.
+- If the board itself was off while the mains was on, the day is marked incomplete, or shown as a
+  range of several days.
+
+### Setup
+
+1. In Telegram, create a group (for example "Home energy"), add your wife and the bot. Optional:
+   rename the bot in @BotFather (`/setname`), because the group sees its name.
+2. In the group, send `/start`. The board ignores it, but it logs the group id and shows it in
+   `GET /health` as `telegram_unknown_chat` (group ids are negative, e.g. `-1001234567890`):
+
+   ```sh
+   curl -s http://192.168.100.21/health
+   ```
+
+3. Add it to `include/WiFiConfig.h` and flash:
+
+   ```c
+   #define TELEGRAM_FAMILY_CHAT_ID  -1001234567890LL
+   ```
+
+4. Check: `curl -s http://192.168.100.21/report` shows the text and `"family_chat":true`, and
+   `curl -X POST http://192.168.100.21/report` posts it to the group now.
+5. Optional: show only the matching commands in each chat's `/` menu, once, from any computer:
+
+   ```sh
+   T=<bot token>
+   curl -s "https://api.telegram.org/bot$T/setMyCommands" -H 'Content-Type: application/json' -d '{"commands":[
+     {"command":"today","description":"Energy used today so far"},
+     {"command":"yesterday","description":"Yesterday'"'"'s consumption"},
+     {"command":"month","description":"This month so far and forecast"}],
+     "scope":{"type":"chat","chat_id":-1001234567890}}'
+   curl -s "https://api.telegram.org/bot$T/setMyCommands" -H 'Content-Type: application/json' -d '{"commands":[
+     {"command":"wol","description":"Wake the ThinkPad T580"},
+     {"command":"status","description":"Is the T580 up, mains voltage and power"},
+     {"command":"today","description":"Energy used today so far"},
+     {"command":"month","description":"This month so far and forecast"}],
+     "scope":{"type":"chat","chat_id":<your chat id>}}'
+   ```
+
+Until `TELEGRAM_FAMILY_CHAT_ID` is set, the daily report goes to your private chat. In the group the
+bot answers commands only, so ordinary chatting there gets no replies. The buttons it offers are
+commands (`/today`), because with privacy mode on (the default) a bot in a group only sees commands.
+If you change the group's type (for example make the chat history visible to new members), Telegram
+can turn it into a supergroup with a new id. The send then fails with HTTP 400 in the logs. Set the
+new id.
+
 ### Target requirements (T580)
 
 - BIOS: `Config > Network > Wake On LAN` set to `AC Only` or `AC and Battery` (currently
@@ -240,15 +341,16 @@ length with `api.telegram.org`, so a connection needs about 16 KB of heap instea
 │   ├── ServerHelper/         Index page and 404 handler
 │   ├── Logger/               JSON logger over UDP (mirrored to Serial)
 │   ├── EnergyPeriods/        PZEM counter -> per-period records + RAM queue (host-tested)
+│   ├── EnergyReport/         Daily/monthly report: history, 07:00 schedule, message texts (host-tested)
 │   ├── MqttPublisher/        MQTT connection with backoff, drains the queue with QoS 1
 │   ├── WakeOnLan/            MAC parsing and magic packet (host-tested)
-│   └── TelegramBot/          Non-blocking Telegram long polling client (getUpdates / sendMessage)
+│   └── TelegramBot/          Non-blocking Telegram long polling client, several chats (getUpdates / sendMessage)
 ├── include/
-│   ├── AppConfig.h           MQTT broker, topic, time zone, NTP servers, Wake-on-LAN target
-│   └── WiFiConfig.example.h  WiFi credentials and Telegram bot token template
+│   ├── AppConfig.h           MQTT broker, topic, time zone, NTP servers, Wake-on-LAN target, price, report time
+│   └── WiFiConfig.example.h  WiFi credentials, Telegram bot token and chat ids template
 ├── scripts/ota_upload.py     PlatformIO custom upload target for OTA
 ├── scripts/mqtt_monitor.py   Prints the MQTT topics
-├── test/host/                Host unit tests for lib/EnergyPeriods and lib/WakeOnLan
+├── test/host/                Host unit tests for lib/EnergyPeriods, lib/EnergyReport and lib/WakeOnLan
 ├── docs/                     MQTT contract, board configuration screenshots
 ├── sloeber_arduino_eclipse/  Original Eclipse Sloeber project (legacy, not built)
 └── platformio.ini            Build environments: d1_mini (USB), d1_mini_ota (WiFi)

@@ -49,8 +49,11 @@ twice and is reported as two records (`+03:00` and `+02:00`).
   record is dropped (`dropped` counter in `GET /health`).
 - A record may be delivered twice (if the acknowledgement is lost). Make the consumer idempotent:
   use `(period, start)` as the unique key and upsert.
-- The period in progress survives a reset/OTA reboot (kept in RTC memory). After a power cycle
-  it starts over and the first record per period has `complete: false`.
+- The period in progress survives a reset/OTA reboot (kept in RTC memory). Day, week and month
+  also survive a power cycle (a flash copy, written at each midnight), because the PZEM counter
+  keeps its value and nothing is consumed while the mains is off. After a power cycle only the hour
+  starts over, so its first record has `complete: false`. Without a flash copy (the very first
+  start), all periods start over and their first records have `complete: false`.
 - The RAM queue does not survive a reboot. Records lost that way can still be derived from `meter_wh`.
 
 For Node-RED: subscribe to `D1MiniProEnergyMeterV1/energy/+` with QoS 1 and a fixed client ID and

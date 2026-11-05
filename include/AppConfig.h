@@ -26,10 +26,19 @@
 // a TCP connect to this port (SSH) tells if the target is up
 #define WOL_CHECK_PORT   22
 
-// Telegram bot: the token and the allowed chat id are secrets, define TELEGRAM_BOT_TOKEN and
-// TELEGRAM_CHAT_ID in include/WiFiConfig.h (git-ignored). Without a token the bot is disabled.
-// Reply keyboard buttons, they send their label as the message text.
+// Telegram bot: the token and the chat ids are secrets, define TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+// (your private chat: Wake-on-LAN) and TELEGRAM_FAMILY_CHAT_ID (family group: energy reports) in
+// include/WiFiConfig.h (git-ignored). Without a token the bot is disabled.
+// Reply keyboard buttons of the private chat, they send their label as the message text.
 #define TELEGRAM_BTN_WAKE    "Wake T580"
 #define TELEGRAM_BTN_STATUS  "Status"
+
+// Daily energy report to the family chat (to the private chat while TELEGRAM_FAMILY_CHAT_ID is
+// not set): yesterday's consumption at this local time, on the 1st also the previous month.
+#define ENERGY_REPORT_HOUR    7
+#define ENERGY_REPORT_MINUTE  0
+// electricity price per kWh, used for all costs in the messages
+#define ENERGY_PRICE_PER_KWH  3.59
+#define ENERGY_CURRENCY       "lei"
 
 #endif /* _AppConfig_H_ */

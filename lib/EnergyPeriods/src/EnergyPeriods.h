@@ -34,13 +34,18 @@ struct EnergyRecord {
 	bool complete;       // false: tracking began mid-period, spans several periods, or meter was reset
 };
 
+// called for every finished period, in the same order the records enter the queue
+typedef void (*EnergyRecordListener)(const EnergyRecord &record);
+
 struct PeriodState {
-	uint32_t start;      // start of the period in progress
+	uint32_t start;      // start of the period in progress, 0 = not tracked yet
 	uint32_t startWh;    // PZEM counter at start
 	uint8_t fromStart;   // 1 if tracking began exactly at start
 };
 
-// POD so it can be stored as-is in RTC memory (survives reset / OTA reboot)
+// POD so it can be stored as-is in RTC memory (survives reset / OTA reboot). A period with
+// start 0 is started on the next update() without a record, so after a power cycle the caller
+// can resume single periods (e.g. day/week/month from flash) and leave the others at 0.
 struct EnergyTrackerState {
 	PeriodState periods[PERIOD_COUNT];
 	uint8_t valid;
@@ -53,6 +58,7 @@ class EnergyPeriods {
 		uint8_t queueHead;
 		uint8_t queueCount;
 		uint16_t droppedCount;
+		EnergyRecordListener listener;
 
 		void push(const EnergyRecord &record);
 
@@ -63,6 +69,8 @@ class EnergyPeriods {
 
 		static time_t periodStart(uint8_t period, time_t t);
 		static const char *periodName(uint8_t period);
+
+		void setListener(EnergyRecordListener l) { listener = l; }
 
 		// true when update() wants a fresh meter reading (not initialized yet or a boundary was crossed)
 		bool needsReading(time_t now) const;

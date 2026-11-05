@@ -8,13 +8,19 @@
  *   GET  /mqtt/test[?msg=text] - publishes a test message to <base>/test (for testing the broker path)
  *   GET  /wol     - Wake-on-LAN target and whether it is up
  *   POST /wol     - sends the Wake-on-LAN magic packet to the target
+ *   GET  /report  - preview of the daily energy report
+ *   POST /report[?to=admin] - sends the daily energy report now (family chat, or the private chat)
  *   POST /update  - OTA firmware update (ESP8266HTTPUpdateServer)
  *
  * MQTT (see include/AppConfig.h, docs/MQTT.md): consumed energy per local hour, day, ISO week and
  * month, published at each period end once the clock is synced over NTP.
  *
- * Telegram bot (token and chat id in include/WiFiConfig.h): /wol wakes the ThinkPad T580 and
- * reports when it is up, /status shows whether it is up plus mains voltage and power.
+ * Telegram bot (token and chat ids in include/WiFiConfig.h), one bot in two chats:
+ *   private chat (TELEGRAM_CHAT_ID): /wol wakes the ThinkPad T580 and reports when it is up,
+ *     /status shows whether it is up plus mains voltage and power
+ *   family group (TELEGRAM_FAMILY_CHAT_ID): yesterday's consumption and cost every day at 07:00,
+ *     on the 1st also the previous month
+ *   both: /today, /yesterday, /month
  */
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -25,11 +31,13 @@
 #include <ArduinoJson.h>
 #include <PZEM004Tv30.h>
 #include <coredecls.h>
+#include <EEPROM.h>
 
 #include "WiFiHelper.h"
 #include "ServerHelper.h"
 #include "Logger.h"
 #include "EnergyPeriods.h"
+#include "EnergyReport.h"
 #include "MqttPublisher.h"
 #include "TelegramBot.h"
 #include "WakeOnLan.h"
@@ -55,6 +63,10 @@
 #define TELEGRAM_CHAT_ID   0
 #endif
 
+#ifndef TELEGRAM_FAMILY_CHAT_ID
+#define TELEGRAM_FAMILY_CHAT_ID  0
+#endif
+
 #define WOL_UDP_PORT          9
 #define WOL_REPEAT            3
 #define WOL_CHECK_TIMEOUT_MS  1500
@@ -71,6 +83,10 @@
 #define RTC_STATE_OFFSET  64
 #define RTC_STATE_MAGIC   0x454E5031  // "ENP1"
 
+// The flash copy (EEPROM sector at 0x3FB000, above the OTA staging area) survives a power cut:
+// day/week/month in progress and the report history. Written ~2 times a day.
+#define FLASH_STATE_MAGIC 0x454E5232  // "ENR2"
+
 void indexPage();
 void handleNotFound();
 void setupHTTPActions();
@@ -81,14 +97,23 @@ void mqttTest();
 void sendSensorData();
 void writeJson(int httpStatus, const JsonDocument &doc);
 void energyLoop(time_t now);
+void onEnergyRecord(const EnergyRecord &record);
 void loadTrackerState();
 void saveTrackerState();
+void loadFlashState();
+void saveFlashState();
+
+void reportPreview();
+void reportSend();
+void reportLoop(time_t now);
 
 void wolStatus();
 void wolWake();
 bool sendWakeOnLan();
 bool targetOnline();
-void telegramCommand(const char *text);
+void telegramCommand(int64_t chatId, const char *text);
+bool energyCommand(int64_t chatId, const char *command);
+void adminCommand(const char *command);
 void telegramWake();
 void telegramStatus();
 void wolFollowupLoop(unsigned long current_time);
@@ -97,9 +122,10 @@ void wolFollowupLoop(unsigned long current_time);
 WiFiHelper wiFiHelper;
 ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
-ServerHelper serverHelper("D1MiniProEnergyMeterV1.3", &server);
+ServerHelper serverHelper("D1MiniProEnergyMeterV1.4", &server);
 Logger logger;
 EnergyPeriods tracker;
+EnergyReport report(ENERGY_PRICE_PER_KWH, ENERGY_CURRENCY, ENERGY_REPORT_HOUR, ENERGY_REPORT_MINUTE);
 MqttPublisher mqtt;
 TelegramBot telegram;
 WiFiUDP wolUdp;
@@ -110,8 +136,24 @@ struct RtcBlob {
 	uint32_t crc;
 };
 
+struct FlashBlob {
+	uint32_t magic;
+	EnergyTrackerState tracker;
+	EnergyReportState report;
+	uint32_t crc;
+};
+
 unsigned long energy_check_timer = 0;
 bool timeSynced = false;
+// the day in progress as of the last flash write, and new report history since
+uint32_t flashDayStart = 0;
+bool flashDirty = false;
+
+// One bot, two chats: Wake-on-LAN only in the private (admin) chat, energy in both.
+// The reports go to the family group, or to the private chat until the group is set up.
+static const int64_t ADMIN_CHAT = TELEGRAM_CHAT_ID;
+static const int64_t FAMILY_CHAT = TELEGRAM_FAMILY_CHAT_ID;
+static const int64_t REPORT_CHAT = (FAMILY_CHAT != 0) ? FAMILY_CHAT : ADMIN_CHAT;
 
 uint8_t wolMac[WOL_MAC_LEN];
 bool wolMacValid = false;
@@ -122,10 +164,25 @@ unsigned long wolFollowupTimer = 0;
 static const char TELEGRAM_KEYBOARD[] =
 		"{\"keyboard\":[[\"" TELEGRAM_BTN_WAKE "\",\"" TELEGRAM_BTN_STATUS "\"]],\"resize_keyboard\":true,\"is_persistent\":true}";
 
+#define ENERGY_COMMANDS_HELP \
+		"/today - energy used today so far\n" \
+		"/yesterday - yesterday's consumption\n" \
+		"/month - this month so far, forecast and last month"
+
 static const char TELEGRAM_HELP[] =
 		"Commands:\n"
 		"/wol - wake the " WOL_TARGET_NAME " (Wake-on-LAN)\n"
-		"/status - is the " WOL_TARGET_NAME " up, mains voltage and power, device uptime";
+		"/status - is the " WOL_TARGET_NAME " up, mains voltage and power, device uptime\n"
+		ENERGY_COMMANDS_HELP;
+
+// in a group the bot only sees commands (privacy mode), so the buttons are commands too
+static const char FAMILY_KEYBOARD[] =
+		"{\"keyboard\":[[\"/today\",\"/yesterday\",\"/month\"]],\"resize_keyboard\":true}";
+
+static const char FAMILY_HELP[] =
+		"Home energy meter. Every morning I post yesterday's consumption and cost here, "
+		"on the 1st also the total for the previous month.\n"
+		ENERGY_COMMANDS_HELP;
 
 // PZEM is wired to a software serial port, the hardware UART (USB) stays free for debug output
 #define PZEM_RX_PIN D5
@@ -152,18 +209,23 @@ void setup()
 	configTime(TIME_ZONE, NTP_SERVER_1, NTP_SERVER_2);
 
 	loadTrackerState();
+	loadFlashState();
+	tracker.setListener(onEnergyRecord);
 	mqtt.begin(MQTT_HOST, MQTT_PORT, MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD, MQTT_BASE_TOPIC, &logger);
 
 	wolMacValid = WakeOnLan::parseMac(WOL_TARGET_MAC, wolMac);
 
-	telegram.begin(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, &logger, telegramCommand);
-	telegram.setReplyMarkup(TELEGRAM_KEYBOARD);
+	telegram.begin(TELEGRAM_BOT_TOKEN, &logger, telegramCommand);
+	telegram.addChat(ADMIN_CHAT);
+	if (FAMILY_CHAT != ADMIN_CHAT) {
+		telegram.addChat(FAMILY_CHAT);
+	}
 
 	// "Power On" here means the mains came back, the target may need a /wol
 	char started[160];
 	snprintf(started, sizeof(started), "D1MiniProEnergyMeterV1 started (reset reason: %s).\nSend /wol to wake the " WOL_TARGET_NAME ".",
 			ESP.getResetReason().c_str());
-	telegram.send(started, true);
+	telegram.send(ADMIN_CHAT, started, TELEGRAM_KEYBOARD);
 
 	Serial.println("Started D1MiniProEnergyMeterV1!");
 }
@@ -186,6 +248,8 @@ void setupHTTPActions() {
 	server.on("/mqtt/test", HTTP_ANY, mqttTest);
 	server.on("/wol", HTTP_GET, wolStatus);
 	server.on("/wol", HTTP_POST, wolWake);
+	server.on("/report", HTTP_GET, reportPreview);
+	server.on("/report", HTTP_POST, reportSend);
 
 	// Not found handler
 	server.onNotFound(handleNotFound);
@@ -206,6 +270,8 @@ void health() {
 	rootDoc["heap"] = ESP.getFreeHeap();
 	rootDoc["telegram"] = telegram.ok();
 	rootDoc["telegram_error"] = telegram.lastError();
+	rootDoc["telegram_unknown_chat"] = telegram.lastUnknownChat();
+	rootDoc["report_due"] = report.due(time(nullptr));
 	writeJson(200, rootDoc);
 }
 
@@ -295,7 +361,9 @@ void sendSensorData() {
 }
 
 void writeJson(int httpStatus, const JsonDocument &doc) {
-	char output[500];
+	// the report preview is longer than a fixed buffer would hold
+	String output;
+	output.reserve(measureJson(doc) + 1);
 	serializeJson(doc, output);
 	server.send(httpStatus, "application/json", output);
 }
@@ -336,6 +404,7 @@ void loop()
 	if ((current_time - energy_check_timer) >= ENERGY_CHECK_INTERVAL_MS) {
 		energy_check_timer = current_time;
 		energyLoop(now);
+		reportLoop(now);
 	}
 
 	if (wiFiHelper.wiFiOk && WiFi.status() == WL_CONNECTED) {
@@ -373,6 +442,18 @@ void energyLoop(time_t now) {
 		doc["new"] = tracker.queued() - queuedBefore;
 		logger.info(doc, "Energy period boundary");
 	}
+
+	// once a day (and right after the first reading), not every hour: flash sectors wear out
+	if (flashDirty || tracker.state.periods[PERIOD_DAY].start != flashDayStart) {
+		saveFlashState();
+	}
+}
+
+// every finished period, called from tracker.update()
+void onEnergyRecord(const EnergyRecord &record) {
+	if (report.add(record)) {
+		flashDirty = true;
+	}
 }
 
 void loadTrackerState() {
@@ -390,6 +471,121 @@ void saveTrackerState() {
 	blob.state = tracker.state;
 	blob.crc = crc32(&blob.state, sizeof(blob.state));
 	ESP.rtcUserMemoryWrite(RTC_STATE_OFFSET, (uint32_t *) &blob, sizeof(blob));
+}
+
+// after loadTrackerState(): RTC memory wins (it has the hour too), the flash copy covers a power cut
+void loadFlashState() {
+	FlashBlob blob;
+	EEPROM.begin(sizeof(blob));
+	EEPROM.get(0, blob);
+	EEPROM.end();
+
+	if (blob.magic != FLASH_STATE_MAGIC || blob.crc != crc32(&blob.tracker, sizeof(blob.tracker) + sizeof(blob.report))) {
+		logger.info("No energy state in flash");
+		return;
+	}
+
+	report.state = blob.report;
+	flashDayStart = blob.tracker.periods[PERIOD_DAY].start;
+
+	JsonDocument doc;
+	doc["days"] = report.state.dayCount;
+	doc["months"] = report.state.monthCount;
+	doc["resumed"] = !tracker.state.valid && blob.tracker.valid;
+	if (!tracker.state.valid && blob.tracker.valid) {
+		// power cut: the PZEM counter kept its value and nothing was consumed while the mains was
+		// off, so day/week/month simply continue. The hour starts over (the copy is from midnight).
+		tracker.state.periods[PERIOD_DAY] = blob.tracker.periods[PERIOD_DAY];
+		tracker.state.periods[PERIOD_WEEK] = blob.tracker.periods[PERIOD_WEEK];
+		tracker.state.periods[PERIOD_MONTH] = blob.tracker.periods[PERIOD_MONTH];
+		tracker.state.valid = 1;
+	}
+	logger.info(doc, "Energy state loaded from flash");
+}
+
+void saveFlashState() {
+	FlashBlob blob;
+	blob.magic = FLASH_STATE_MAGIC;
+	blob.tracker = tracker.state;
+	blob.report = report.state;
+	blob.crc = crc32(&blob.tracker, sizeof(blob.tracker) + sizeof(blob.report));
+
+	EEPROM.begin(sizeof(blob));
+	EEPROM.put(0, blob);
+	bool ok = EEPROM.commit();
+	EEPROM.end();
+
+	flashDayStart = tracker.state.periods[PERIOD_DAY].start;
+	flashDirty = false;
+
+	JsonDocument doc;
+	doc["ok"] = ok;
+	logger.info(doc, "Energy state saved to flash");
+}
+
+/* ------------------------------------------------------------------------- */
+/*  Daily energy report  */
+void reportLoop(time_t now) {
+	if (!telegram.enabled() || !report.due(now)) {
+		return;
+	}
+
+	char msg[TELEGRAM_MSG_MAX];
+	report.daily(msg, sizeof(msg), now, tracker.state.periods[PERIOD_MONTH]);
+	if (!telegram.send(REPORT_CHAT, msg)) {
+		// a reply is waiting to go out, try again on the next check
+		return;
+	}
+
+	report.markReported();
+	saveFlashState();
+
+	JsonDocument doc;
+	doc["chat_id"] = REPORT_CHAT;
+	doc["day"] = report.state.reportedDayEnd;
+	logger.info(doc, "Daily energy report queued");
+}
+
+void reportPreview() {
+	time_t now = time(nullptr);
+	char msg[TELEGRAM_MSG_MAX];
+
+	JsonDocument rootDoc;
+	rootDoc["chat_id"] = REPORT_CHAT;
+	rootDoc["family_chat"] = FAMILY_CHAT != 0;
+	rootDoc["due"] = report.due(now);
+	rootDoc["days"] = report.state.dayCount;
+	rootDoc["months"] = report.state.monthCount;
+	if (report.daily(msg, sizeof(msg), now, tracker.state.periods[PERIOD_MONTH]) > 0) {
+		rootDoc["text"] = (const char *) msg;
+	} else {
+		rootDoc["text"] = nullptr;
+		rootDoc["error"] = "No finished day yet, the first one is ready after midnight";
+	}
+	writeJson(200, rootDoc);
+}
+
+// sends the preview without marking it as reported, the 07:00 message still goes out
+void reportSend() {
+	time_t now = time(nullptr);
+	int64_t chat = (server.arg("to") == "admin") ? ADMIN_CHAT : REPORT_CHAT;
+	char msg[TELEGRAM_MSG_MAX];
+
+	JsonDocument rootDoc;
+	rootDoc["chat_id"] = chat;
+	int status = 200;
+	if (report.daily(msg, sizeof(msg), now, tracker.state.periods[PERIOD_MONTH]) == 0) {
+		status = 409;
+		rootDoc["success"] = false;
+		rootDoc["error"] = "No finished day yet, the first one is ready after midnight";
+	} else if (!telegram.send(chat, msg)) {
+		status = 503;
+		rootDoc["success"] = false;
+		rootDoc["error"] = telegram.enabled() ? "Another Telegram message is waiting, try again" : "Telegram bot disabled";
+	} else {
+		rootDoc["success"] = true;
+	}
+	writeJson(status, rootDoc);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -455,7 +651,8 @@ bool targetOnline() {
 
 /* ------------------------------------------------------------------------- */
 /*  Telegram commands  */
-void telegramCommand(const char *text) {
+// only allowed chats get here (TelegramBot drops the rest)
+void telegramCommand(int64_t chatId, const char *text) {
 	char command[TELEGRAM_TEXT_MAX];
 	strlcpy(command, text, sizeof(command));
 
@@ -465,24 +662,69 @@ void telegramCommand(const char *text) {
 		*at = 0;
 	}
 
+	if (energyCommand(chatId, command)) {
+		return;
+	}
+
+	if (chatId == ADMIN_CHAT) {
+		adminCommand(command);
+	} else if (command[0] == '/') {
+		// Wake-on-LAN stays in the private chat; also the answer to /start. Other group
+		// messages (chatter, "X joined") get no answer.
+		telegram.send(chatId, FAMILY_HELP, FAMILY_KEYBOARD);
+	}
+}
+
+// /today, /yesterday, /month in any allowed chat, the answer goes back to that chat
+bool energyCommand(int64_t chatId, const char *command) {
+	bool today = strcasecmp(command, "/today") == 0;
+	bool yesterday = strcasecmp(command, "/yesterday") == 0;
+	bool month = strcasecmp(command, "/month") == 0;
+	if (!today && !yesterday && !month) {
+		return false;
+	}
+
+	time_t now = time(nullptr);
+	char msg[TELEGRAM_MSG_MAX];
+	if (now < TIME_VALID_AFTER) {
+		strlcpy(msg, "The clock is not synced yet, try again in a minute.", sizeof(msg));
+	} else if (yesterday) {
+		report.yesterday(msg, sizeof(msg), now);
+	} else {
+		float energy = pzem.energy();
+		if (isnan(energy)) {
+			strlcpy(msg, "The energy meter (PZEM) does not answer, try again later.", sizeof(msg));
+		} else if (today) {
+			report.today(msg, sizeof(msg), now, (uint32_t) lroundf(energy * 1000.0f), pzem.power(),
+					tracker.state.periods[PERIOD_DAY]);
+		} else {
+			report.month(msg, sizeof(msg), now, (uint32_t) lroundf(energy * 1000.0f), tracker.state.periods[PERIOD_MONTH]);
+		}
+	}
+
+	telegram.send(chatId, msg);
+	return true;
+}
+
+void adminCommand(const char *command) {
 	if (strcasecmp(command, "/wol") == 0 || strcasecmp(command, TELEGRAM_BTN_WAKE) == 0) {
 		telegramWake();
 	} else if (strcasecmp(command, "/status") == 0 || strcasecmp(command, TELEGRAM_BTN_STATUS) == 0) {
 		telegramStatus();
 	} else {
 		// also the answer to /start
-		telegram.send(TELEGRAM_HELP, true);
+		telegram.send(ADMIN_CHAT, TELEGRAM_HELP, TELEGRAM_KEYBOARD);
 	}
 }
 
 void telegramWake() {
 	if (targetOnline()) {
-		telegram.send(WOL_TARGET_NAME " is already up (SSH answers).");
+		telegram.send(ADMIN_CHAT, WOL_TARGET_NAME " is already up (SSH answers).");
 		return;
 	}
 
 	if (!sendWakeOnLan()) {
-		telegram.send("Sending the magic packet failed, see the logs.");
+		telegram.send(ADMIN_CHAT, "Sending the magic packet failed, see the logs.");
 		return;
 	}
 
@@ -493,7 +735,7 @@ void telegramWake() {
 	char msg[200];
 	snprintf(msg, sizeof(msg), "Magic packet sent to " WOL_TARGET_NAME " (" WOL_TARGET_MAC "). "
 			"I will tell you when it is up (watching for %lu min).", WOL_FOLLOWUP_WINDOW_MS / 60000UL);
-	telegram.send(msg);
+	telegram.send(ADMIN_CHAT, msg);
 }
 
 void telegramStatus() {
@@ -514,7 +756,7 @@ void telegramStatus() {
 			up ? "up (SSH answers)" : "down (no answer on SSH)",
 			(!up && wolFollowup) ? ", waiting for it after /wol" : "",
 			mains, s / 86400, (s / 3600) % 24, (s / 60) % 60, ESP.getFreeHeap(), WiFi.RSSI());
-	telegram.send(msg);
+	telegram.send(ADMIN_CHAT, msg);
 }
 
 void wolFollowupLoop(unsigned long current_time) {
@@ -535,7 +777,7 @@ void wolFollowupLoop(unsigned long current_time) {
 	}
 
 	// if a reply is still waiting to go out, try again on the next check
-	if (telegram.send(msg)) {
+	if (telegram.send(ADMIN_CHAT, msg)) {
 		wolFollowup = false;
 	}
 }

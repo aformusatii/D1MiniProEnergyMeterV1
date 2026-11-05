@@ -18,8 +18,8 @@ static char body[TELEGRAM_BODY_MAX + 1];
 TelegramBot::TelegramBot() {
 	logger = nullptr;
 	token = nullptr;
-	chatId = 0;
-	replyMarkup = nullptr;
+	chatCount = 0;
+	unknownChat = 0;
 
 	state = STATE_DISABLED;
 	stateTime = 0;
@@ -38,10 +38,11 @@ TelegramBot::TelegramBot() {
 
 	outbox[0] = 0;
 	outboxFull = false;
-	outboxKeyboard = false;
+	outboxChat = 0;
+	outboxMarkup = nullptr;
 }
 
-void TelegramBot::begin(const char *_token, int64_t _chatId, Logger *_logger, TelegramHandler _handler) {
+void TelegramBot::begin(const char *_token, Logger *_logger, TelegramHandler _handler) {
 	logger = _logger;
 	handler = _handler;
 
@@ -51,7 +52,6 @@ void TelegramBot::begin(const char *_token, int64_t _chatId, Logger *_logger, Te
 	}
 
 	token = _token;
-	chatId = _chatId;
 	state = STATE_IDLE;
 
 	// no certificate check: a CA change on Telegram's side must not lock out the only remote access
@@ -59,13 +59,22 @@ void TelegramBot::begin(const char *_token, int64_t _chatId, Logger *_logger, Te
 	client.setTimeout(TELEGRAM_TLS_TIMEOUT_MS);
 }
 
-bool TelegramBot::send(const char *text, bool keyboard) {
-	if (!enabled() || outboxFull) {
+bool TelegramBot::addChat(int64_t chatId) {
+	if (chatId == 0 || chatCount == TELEGRAM_MAX_CHATS) {
+		return false;
+	}
+	chats[chatCount++] = chatId;
+	return true;
+}
+
+bool TelegramBot::send(int64_t chatId, const char *text, const char *replyMarkup) {
+	if (!enabled() || outboxFull || chatId == 0) {
 		return false;
 	}
 
 	strlcpy(outbox, text, sizeof(outbox));
-	outboxKeyboard = keyboard;
+	outboxChat = chatId;
+	outboxMarkup = replyMarkup;
 	outboxFull = true;
 	return true;
 }
@@ -153,10 +162,11 @@ void TelegramBot::sendRequest(unsigned long current_time) {
 		readTimeout = TELEGRAM_POLL_TIMEOUT_S * 1000UL + TELEGRAM_READ_SLACK_MS;
 	} else {
 		method = "sendMessage";
-		doc["chat_id"] = chatId;
-		doc["text"] = outbox;
-		if (outboxKeyboard && replyMarkup != nullptr) {
-			doc["reply_markup"] = serialized(replyMarkup);
+		doc["chat_id"] = outboxChat;
+		// const char * is stored by reference, not copied into the document
+		doc["text"] = (const char *) outbox;
+		if (outboxMarkup != nullptr) {
+			doc["reply_markup"] = serialized(outboxMarkup);
 		}
 		readTimeout = TELEGRAM_SEND_TIMEOUT_MS;
 	}
@@ -284,6 +294,9 @@ void TelegramBot::finish(unsigned long current_time) {
 	if (!deserializeJson(answer, body) && answer["description"].is<const char *>()) {
 		doc["description"] = answer["description"];
 	}
+	if (!requestIsPoll) {
+		doc["chat_id"] = outboxChat;
+	}
 	logger->error(doc, "Telegram request failed");
 
 	error = httpStatus;
@@ -341,8 +354,13 @@ void TelegramBot::handleMessage(JsonObject message) {
 	doc["chat_id"] = from;
 	doc["text"] = text;
 
-	if (from != chatId) {
-		// the chat id shows up in the logs this way, also handy when setting up TELEGRAM_CHAT_ID
+	bool allowed = false;
+	for (uint8_t i = 0; i < chatCount; i++) {
+		allowed = allowed || chats[i] == from;
+	}
+	if (!allowed) {
+		// the chat id shows up in the logs and in /health this way, handy when setting up the chat ids
+		unknownChat = from;
 		logger->error(doc, "Telegram message from unknown chat ignored");
 		return;
 	}
@@ -359,7 +377,7 @@ void TelegramBot::handleMessage(JsonObject message) {
 
 	char command[TELEGRAM_TEXT_MAX];
 	strlcpy(command, text, sizeof(command));
-	handler(command);
+	handler(from, command);
 }
 
 void TelegramBot::fail(unsigned long current_time, int code, const char *msg) {

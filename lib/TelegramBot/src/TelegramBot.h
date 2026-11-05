@@ -28,20 +28,23 @@
 
 #define TELEGRAM_BODY_MAX         1536
 #define TELEGRAM_TEXT_MAX           64
-#define TELEGRAM_MSG_MAX           400
+#define TELEGRAM_MSG_MAX           640
+// e.g. your private chat and a family group
+#define TELEGRAM_MAX_CHATS           2
 
 // commands sent while the device was offline (e.g. during a power cut) are ignored when older
 #define TELEGRAM_MAX_AGE_S         300
 #define TELEGRAM_TIME_VALID_AFTER  1700000000
 
-typedef std::function<void(const char *text)> TelegramHandler;
+typedef std::function<void(int64_t chatId, const char *text)> TelegramHandler;
 
 /*
  * Minimal non-blocking Telegram Bot API client (getUpdates long polling + sendMessage) over one
- * kept-alive TLS connection. Only messages from the configured chat reach the handler, others are
+ * kept-alive TLS connection. One bot serves several chats (addChat()): only messages from those
+ * chats reach the handler, together with the chat id, so the caller can route them. Others are
  * logged with their chat id and ignored.
  *
- * One reply can be queued at a time (send()). A queued reply interrupts a running long poll, which
+ * One message can be queued at a time (send()), to any of the chats. A queued reply interrupts a running long poll, which
  * is safe: an update counts as received only once the next getUpdates confirms its offset.
  * Only the TLS connect (~1-2 s, rare with keep-alive) blocks loop().
  */
@@ -53,8 +56,9 @@ class TelegramBot {
 		TelegramHandler handler;
 
 		const char *token;
-		int64_t chatId;
-		const char *replyMarkup;
+		int64_t chats[TELEGRAM_MAX_CHATS];
+		uint8_t chatCount;
+		int64_t unknownChat;
 
 		uint8_t state;
 		unsigned long stateTime;
@@ -75,7 +79,8 @@ class TelegramBot {
 
 		char outbox[TELEGRAM_MSG_MAX];
 		bool outboxFull;
-		bool outboxKeyboard;
+		int64_t outboxChat;
+		const char *outboxMarkup;
 
 		bool connect(void);
 		void sendRequest(unsigned long current_time);
@@ -91,13 +96,14 @@ class TelegramBot {
 		TelegramBot(void);
 
 		// token nullptr or empty disables the bot
-		void begin(const char *token, int64_t chatId, Logger *logger, TelegramHandler handler);
+		void begin(const char *token, Logger *logger, TelegramHandler handler);
 
-		// reply_markup JSON attached to messages sent with keyboard = true
-		void setReplyMarkup(const char *json) { replyMarkup = json; }
+		// Accepts messages from this chat (user id, or negative group id). 0 is ignored.
+		bool addChat(int64_t chatId);
 
-		// Queues one message to the configured chat. Returns false if one is already waiting.
-		bool send(const char *text, bool keyboard = false);
+		// Queues one message to chatId. replyMarkup is reply_markup JSON (e.g. a keyboard), it must
+		// stay valid until the message is sent. Returns false if one is already waiting.
+		bool send(int64_t chatId, const char *text, const char *replyMarkup = nullptr);
 
 		// Call from loop() while WiFi is connected
 		void loop(unsigned long current_time);
@@ -107,6 +113,8 @@ class TelegramBot {
 		bool ok(void) { return enabled() && error == 0 && client.connected(); }
 		// 0 = ok, HTTP status from Telegram (401 bad token, 409 another poller, ...), -1 connection, -2 low heap
 		int lastError(void) { return error; }
+		// last chat the bot got a message from that is not allowed, 0 = none (for setting up chat ids)
+		int64_t lastUnknownChat(void) { return unknownChat; }
 };
 
 #endif /* _TelegramBot_H_ */
